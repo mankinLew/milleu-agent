@@ -1,6 +1,7 @@
 # server.py
 import os
 import traceback
+import openai  # <--- add this
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,6 +9,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
+
+print("OpenAI package version on server:", openai.__version__)
 
 app = FastAPI()
 
