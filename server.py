@@ -1,7 +1,7 @@
 # server.py
 import os
 import traceback
-from typing import Optional
+from typing import Optional, Any
 
 import requests
 from dotenv import load_dotenv
@@ -9,12 +9,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# 🔹 Import your exported Agent Builder workflow code
-# Replace 'agent_workflow' and 'run_workflow'
-# with the actual module + function name from your export
-from agent_workflow import run_workflow
+from agent_workflow import run_workflow, WorkflowInput  # uses your exported agent
 
-# Load .env if running locally
 load_dotenv()
 
 app = FastAPI()
@@ -22,7 +18,7 @@ app = FastAPI()
 # CORS so Freshdesk + n8n can call the backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to specific domains in prod
+    allow_origins=["*"],  # tighten later if you want
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,8 +27,10 @@ app.add_middleware(
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CHATKIT_WORKFLOW_ID = os.getenv("CHATKIT_WORKFLOW_ID")
 
-# ---------- Pydantic models ----------
 
+# ----------------------------
+# Models
+# ----------------------------
 class SessionRequest(BaseModel):
     user_id: Optional[str] = None
 
@@ -42,8 +40,36 @@ class N8nChatRequest(BaseModel):
     message: str
 
 
-# ---------- Health check ----------
+# ----------------------------
+# Helpers
+# ----------------------------
+def extract_reply_text(result: Any) -> str:
+    """
+    Normalize the agent result into a single string for n8n.
+    """
+    if result is None:
+        return ""
 
+    # Most branches return {"message": "..."}
+    if isinstance(result, dict):
+        if isinstance(result.get("message"), str):
+            return result["message"]
+        # Sometimes guardrails returns {"safe_text": "..."} etc.
+        if isinstance(result.get("safe_text"), str):
+            return result["safe_text"]
+        # Fallback: show something sensible
+        return str(result)
+
+    # If it's already a string
+    if isinstance(result, str):
+        return result
+
+    return str(result)
+
+
+# ----------------------------
+# Health check
+# ----------------------------
 @app.get("/")
 async def root():
     return {
@@ -53,14 +79,11 @@ async def root():
     }
 
 
-# ---------- ChatKit session endpoint (Freshdesk) ----------
-
+# ----------------------------
+# ChatKit session endpoint (Freshdesk ChatKit widget)
+# ----------------------------
 @app.post("/api/chatkit/session")
 async def create_chatkit_session(body: SessionRequest):
-    """
-    For Freshdesk ChatKit:
-    Returns a client_secret for the given user.
-    """
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OPENAI_API_KEY is not set")
     if not CHATKIT_WORKFLOW_ID:
@@ -76,11 +99,8 @@ async def create_chatkit_session(body: SessionRequest):
                 "Content-Type": "application/json",
                 "OpenAI-Beta": "chatkit_beta=v1",
             },
-            json={
-                "workflow": {"id": CHATKIT_WORKFLOW_ID},
-                "user": user,
-            },
-            timeout=10,
+            json={"workflow": {"id": CHATKIT_WORKFLOW_ID}, "user": user},
+            timeout=20,
         )
 
         if not resp.ok:
@@ -107,25 +127,21 @@ async def create_chatkit_session(body: SessionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------- n8n chat endpoint (n8n chat widget) ----------
-
+# ----------------------------
+# n8n chat endpoint (n8n chat widget)
+# ----------------------------
 @app.post("/n8n/chat")
 async def n8n_chat(req: N8nChatRequest):
     """
-    For n8n chat widget:
-    Calls the SAME Agent Builder workflow code that powers ChatKit
-    (via the exported Agents SDK code).
+    n8n sends: { "sessionId": "...", "message": "..." }
+    We run the SAME exported Agent Builder workflow and return: { "reply": "..." }
     """
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "OPENAI_API_KEY is not set")
-
     try:
-        # Use sessionId to keep multi-turn context, if your exported code supports it
-        session_id = req.sessionId or "anonymous"
+        # Run the exported agent workflow (async)
+        workflow_input = WorkflowInput(input_as_text=req.message)
+        result = await run_workflow(workflow_input)
 
-        # 🔹 This is the key part: call the exported workflow instead of a plain model
-        reply_text = run_workflow(input_text=req.message, session_id=session_id)
-
+        reply_text = extract_reply_text(result)
         return {"reply": reply_text}
 
     except Exception as e:
