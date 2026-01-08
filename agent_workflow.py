@@ -1,148 +1,170 @@
-import { tool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
-import { z } from "zod";
-import { OpenAI } from "openai";
-import { runGuardrails } from "@openai/guardrails";
+from agents import function_tool, Agent, ModelSettings, TResponseInputItem, Runner, RunConfig, trace
+from openai import AsyncOpenAI
+from types import SimpleNamespace
+from guardrails.runtime import load_config_bundle, instantiate_guardrails, run_guardrails
+from pydantic import BaseModel
 
+# Tool definitions
+@function_tool
+def get_retention_offers(customer_id: str, account_type: str, current_plan: str, tenure_months: integer, recent_complaints: bool):
+  pass
 
-// Tool definitions
-const getRetentionOffers = tool({
-  name: "getRetentionOffers",
-  description: "Retrieve possible retention offers for a customer",
-  parameters: z.object({
-    customer_id: z.string(),
-    account_type: z.string(),
-    current_plan: z.string(),
-    tenure_months: z.integer(),
-    recent_complaints: z.boolean()
-  }),
-  execute: async (input: {customer_id: string, account_type: string, current_plan: string, tenure_months: integer, recent_complaints: boolean}) => {
-    // TODO: Unimplemented
-  },
-});
-
-// Shared client for guardrails and file search
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// Guardrails definitions
-const jailbreakGuardrailConfig = {
-  guardrails: [
-    { name: "Jailbreak", config: { model: "gpt-5-nano", confidence_threshold: 0.7 } }
+# Shared client for guardrails and file search
+client = AsyncOpenAI()
+ctx = SimpleNamespace(guardrail_llm=client)
+# Guardrails definitions
+jailbreak_guardrail_config = {
+  "guardrails": [
+    { "name": "Jailbreak", "config": { "model": "gpt-5-nano", "confidence_threshold": 0.7 } }
   ]
-};
-const context = { guardrailLlm: client };
-
-function guardrailsHasTripwire(results: any[]): boolean {
-    return (results ?? []).some((r) => r?.tripwireTriggered === true);
 }
+def guardrails_has_tripwire(results):
+    return any((hasattr(r, "tripwire_triggered") and (r.tripwire_triggered is True)) for r in (results or []))
 
-function getGuardrailSafeText(results: any[], fallbackText: string): string {
-    for (const r of results ?? []) {
-        if (r?.info && ("checked_text" in r.info)) {
-            return r.info.checked_text ?? fallbackText;
-        }
-    }
-    const pii = (results ?? []).find((r) => r?.info && "anonymized_text" in r.info);
-    return pii?.info?.anonymized_text ?? fallbackText;
-}
+def get_guardrail_safe_text(results, fallback_text):
+    for r in (results or []):
+        info = (r.info if hasattr(r, "info") else None) or {}
+        if isinstance(info, dict) and ("checked_text" in info):
+            return info.get("checked_text") or fallback_text
+    pii = next(((r.info if hasattr(r, "info") else {}) for r in (results or []) if isinstance((r.info if hasattr(r, "info") else None) or {}, dict) and ("anonymized_text" in ((r.info if hasattr(r, "info") else None) or {}))), None)
+    if isinstance(pii, dict) and ("anonymized_text" in pii):
+        return pii.get("anonymized_text") or fallback_text
+    return fallback_text
 
-async function scrubConversationHistory(history: any[], piiOnly: any): Promise<void> {
-    for (const msg of history ?? []) {
-        const content = Array.isArray(msg?.content) ? msg.content : [];
-        for (const part of content) {
-            if (part && typeof part === "object" && part.type === "input_text" && typeof part.text === "string") {
-                const res = await runGuardrails(part.text, piiOnly, context, true);
-                part.text = getGuardrailSafeText(res, part.text);
-            }
-        }
-    }
-}
+async def scrub_conversation_history(history, config):
+    try:
+        guardrails = (config or {}).get("guardrails") or []
+        pii = next((g for g in guardrails if (g or {}).get("name") == "Contains PII"), None)
+        if not pii:
+            return
+        pii_only = {"guardrails": [pii]}
+        for msg in (history or []):
+            content = (msg or {}).get("content") or []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "input_text" and isinstance(part.get("text"), str):
+                    res = await run_guardrails(ctx, part["text"], "text/plain", instantiate_guardrails(load_config_bundle(pii_only)), suppress_tripwire=True, raise_guardrail_errors=True)
+                    part["text"] = get_guardrail_safe_text(res, part["text"])
+    except Exception:
+        pass
 
-async function scrubWorkflowInput(workflow: any, inputKey: string, piiOnly: any): Promise<void> {
-    if (!workflow || typeof workflow !== "object") return;
-    const value = workflow?.[inputKey];
-    if (typeof value !== "string") return;
-    const res = await runGuardrails(value, piiOnly, context, true);
-    workflow[inputKey] = getGuardrailSafeText(res, value);
-}
+async def scrub_workflow_input(workflow, input_key, config):
+    try:
+        guardrails = (config or {}).get("guardrails") or []
+        pii = next((g for g in guardrails if (g or {}).get("name") == "Contains PII"), None)
+        if not pii:
+            return
+        if not isinstance(workflow, dict):
+            return
+        value = workflow.get(input_key)
+        if not isinstance(value, str):
+            return
+        pii_only = {"guardrails": [pii]}
+        res = await run_guardrails(ctx, value, "text/plain", instantiate_guardrails(load_config_bundle(pii_only)), suppress_tripwire=True, raise_guardrail_errors=True)
+        workflow[input_key] = get_guardrail_safe_text(res, value)
+    except Exception:
+        pass
 
-async function runAndApplyGuardrails(inputText: string, config: any, history: any[], workflow: any) {
-    const guardrails = Array.isArray(config?.guardrails) ? config.guardrails : [];
-    const results = await runGuardrails(inputText, config, context, true);
-    const shouldMaskPII = guardrails.find((g) => (g?.name === "Contains PII") && g?.config && g.config.block === false);
-    if (shouldMaskPII) {
-        const piiOnly = { guardrails: [shouldMaskPII] };
-        await scrubConversationHistory(history, piiOnly);
-        await scrubWorkflowInput(workflow, "input_as_text", piiOnly);
-        await scrubWorkflowInput(workflow, "input_text", piiOnly);
-    }
-    const hasTripwire = guardrailsHasTripwire(results);
-    const safeText = getGuardrailSafeText(results, inputText) ?? inputText;
-    return { results, hasTripwire, safeText, failOutput: buildGuardrailFailOutput(results ?? []), passOutput: { safe_text: safeText } };
-}
+async def run_and_apply_guardrails(input_text, config, history, workflow):
+    results = await run_guardrails(ctx, input_text, "text/plain", instantiate_guardrails(load_config_bundle(config)), suppress_tripwire=True, raise_guardrail_errors=True)
+    guardrails = (config or {}).get("guardrails") or []
+    mask_pii = next((g for g in guardrails if (g or {}).get("name") == "Contains PII" and ((g or {}).get("config") or {}).get("block") is False), None) is not None
+    if mask_pii:
+        await scrub_conversation_history(history, config)
+        await scrub_workflow_input(workflow, "input_as_text", config)
+        await scrub_workflow_input(workflow, "input_text", config)
+    has_tripwire = guardrails_has_tripwire(results)
+    safe_text = get_guardrail_safe_text(results, input_text)
+    fail_output = build_guardrail_fail_output(results or [])
+    pass_output = {"safe_text": (get_guardrail_safe_text(results, input_text) or input_text)}
+    return {"results": results, "has_tripwire": has_tripwire, "safe_text": safe_text, "fail_output": fail_output, "pass_output": pass_output}
 
-function buildGuardrailFailOutput(results: any[]) {
-    const get = (name: string) => (results ?? []).find((r: any) => ((r?.info?.guardrail_name ?? r?.info?.guardrailName) === name));
-    const pii = get("Contains PII"), mod = get("Moderation"), jb = get("Jailbreak"), hal = get("Hallucination Detection"), nsfw = get("NSFW Text"), url = get("URL Filter"), custom = get("Custom Prompt Check"), pid = get("Prompt Injection Detection"), piiCounts = Object.entries(pii?.info?.detected_entities ?? {}).filter(([, v]) => Array.isArray(v)).map(([k, v]) => k + ":" + v.length), conf = jb?.info?.confidence;
+def build_guardrail_fail_output(results):
+    def _get(name: str):
+        for r in (results or []):
+            info = (r.info if hasattr(r, "info") else None) or {}
+            gname = (info.get("guardrail_name") if isinstance(info, dict) else None) or (info.get("guardrailName") if isinstance(info, dict) else None)
+            if gname == name:
+                return r
+        return None
+    pii, mod, jb, hal, nsfw, url, custom, pid = map(_get, ["Contains PII", "Moderation", "Jailbreak", "Hallucination Detection", "NSFW Text", "URL Filter", "Custom Prompt Check", "Prompt Injection Detection"])
+    def _tripwire(r):
+        return bool(r.tripwire_triggered)
+    def _info(r):
+        return r.info
+    jb_info, hal_info, nsfw_info, url_info, custom_info, pid_info, mod_info, pii_info = map(_info, [jb, hal, nsfw, url, custom, pid, mod, pii])
+    detected_entities = pii_info.get("detected_entities") if isinstance(pii_info, dict) else {}
+    pii_counts = []
+    if isinstance(detected_entities, dict):
+        for k, v in detected_entities.items():
+            if isinstance(v, list):
+                pii_counts.append(f"{k}:{len(v)}")
+    flagged_categories = (mod_info.get("flagged_categories") if isinstance(mod_info, dict) else None) or []
+    
     return {
-        pii: { failed: (piiCounts.length > 0) || pii?.tripwireTriggered === true, detected_counts: piiCounts },
-        moderation: { failed: mod?.tripwireTriggered === true || ((mod?.info?.flagged_categories ?? []).length > 0), flagged_categories: mod?.info?.flagged_categories },
-        jailbreak: { failed: jb?.tripwireTriggered === true },
-        hallucination: { failed: hal?.tripwireTriggered === true, reasoning: hal?.info?.reasoning, hallucination_type: hal?.info?.hallucination_type, hallucinated_statements: hal?.info?.hallucinated_statements, verified_statements: hal?.info?.verified_statements },
-        nsfw: { failed: nsfw?.tripwireTriggered === true },
-        url_filter: { failed: url?.tripwireTriggered === true },
-        custom_prompt_check: { failed: custom?.tripwireTriggered === true },
-        prompt_injection: { failed: pid?.tripwireTriggered === true },
-    };
-}
-const ClassificationAgentSchema = z.object({ classification: z.enum(["return_item", "cancel_subscription", "get_information"]) });
-const classificationAgent = new Agent({
-  name: "Classification agent",
-  instructions: `Classify the user’s intent into one of the following categories: \"return_item\" or \"get_information\". 
+        "pii": { "failed": (len(pii_counts) > 0) or _tripwire(pii), "detected_counts": pii_counts },
+        "moderation": { "failed": _tripwire(mod) or (len(flagged_categories) > 0), "flagged_categories": flagged_categories },
+        "jailbreak": { "failed": _tripwire(jb) },
+        "hallucination": { "failed": _tripwire(hal), "reasoning": (hal_info.get("reasoning") if isinstance(hal_info, dict) else None), "hallucination_type": (hal_info.get("hallucination_type") if isinstance(hal_info, dict) else None), "hallucinated_statements": (hal_info.get("hallucinated_statements") if isinstance(hal_info, dict) else None), "verified_statements": (hal_info.get("verified_statements") if isinstance(hal_info, dict) else None) },
+        "nsfw": { "failed": _tripwire(nsfw) },
+        "url_filter": { "failed": _tripwire(url) },
+        "custom_prompt_check": { "failed": _tripwire(custom) },
+        "prompt_injection": { "failed": _tripwire(pid) },
+    }
+class ClassificationAgentSchema(BaseModel):
+  classification: str
+
+
+classification_agent = Agent(
+  name="Classification agent",
+  instructions="""Classify the user’s intent into one of the following categories: \"return_item\" or \"get_information\". 
 
 1. Any device-related return requests should route to return_item.
-3. Any other requests should go to get_information.`,
-  model: "gpt-4.1-mini",
-  outputType: ClassificationAgentSchema,
-  modelSettings: {
-    temperature: 1,
-    topP: 1,
-    maxTokens: 2048,
-    store: true
-  }
-});
+3. Any other requests should go to get_information.""",
+  model="gpt-4.1-mini",
+  output_type=ClassificationAgentSchema,
+  model_settings=ModelSettings(
+    temperature=1,
+    top_p=1,
+    max_tokens=2048,
+    store=True
+  )
+)
 
-const returnAgent = new Agent({
-  name: "Return agent",
-  instructions: `Offer a replacement device with free shipping.
-`,
-  model: "gpt-4.1-mini",
-  modelSettings: {
-    temperature: 1,
-    topP: 1,
-    maxTokens: 2048,
-    store: true
-  }
-});
 
-const retentionAgent = new Agent({
-  name: "Retention Agent",
-  instructions: "You are a customer retention conversational agent whose goal is to prevent subscription cancellations. Ask for their current plan and reason for dissatisfaction. Use the get_retention_offers to identify return options. For now, just say there is a 20% offer available for 1 year.",
-  model: "gpt-4.1-mini",
-  tools: [
-    getRetentionOffers
+return_agent = Agent(
+  name="Return agent",
+  instructions="""Offer a replacement device with free shipping.
+""",
+  model="gpt-4.1-mini",
+  model_settings=ModelSettings(
+    temperature=1,
+    top_p=1,
+    max_tokens=2048,
+    store=True
+  )
+)
+
+
+retention_agent = Agent(
+  name="Retention Agent",
+  instructions="You are a customer retention conversational agent whose goal is to prevent subscription cancellations. Ask for their current plan and reason for dissatisfaction. Use the get_retention_offers to identify return options. For now, just say there is a 20% offer available for 1 year.",
+  model="gpt-4.1-mini",
+  tools=[
+    get_retention_offers
   ],
-  modelSettings: {
-    temperature: 1,
-    topP: 1,
-    parallelToolCalls: true,
-    maxTokens: 2048,
-    store: true
-  }
-});
+  model_settings=ModelSettings(
+    temperature=1,
+    top_p=1,
+    parallel_tool_calls=True,
+    max_tokens=2048,
+    store=True
+  )
+)
 
-const informationAgent = new Agent({
-  name: "Information agent",
-  instructions: `You are an information agent for answering informational queries. Your aim is to provide clear, concise responses to user questions. Use the policy below to assemble your answer.
+
+information_agent = Agent(
+  name="Information agent",
+  instructions="""You are an information agent for answering informational queries. Your aim is to provide clear, concise responses to user questions. Use the policy below to assemble your answer.
 
 Company Name: Milieu Insights Region: South East Asia
 Milieu Support Chatbot – Master Instruction Set
@@ -348,110 +370,113 @@ Referral count
 Referral cap
 Successful when:
 Friend signs up with code
-Friend completes 7 surveys`,
-  model: "gpt-4.1-mini",
-  modelSettings: {
-    temperature: 1,
-    topP: 1,
-    maxTokens: 2048,
-    store: true
-  }
-});
-
-const approvalRequest = (message: string) => {
-
-  // TODO: Implement
-  return true;
-}
-
-type WorkflowInput = { input_as_text: string };
+Friend completes 7 surveys""",
+  model="gpt-4.1-mini",
+  model_settings=ModelSettings(
+    temperature=1,
+    top_p=1,
+    max_tokens=2048,
+    store=True
+  )
+)
 
 
-// Main code entrypoint
-export const runWorkflow = async (workflow: WorkflowInput) => {
-  return await withTrace("Milieu Agent", async () => {
-    const state = {
+def approval_request(message: str):
+  # TODO: Implement
+  return True
 
-    };
-    const conversationHistory: AgentInputItem[] = [
-      { role: "user", content: [{ type: "input_text", text: workflow.input_as_text }] }
-    ];
-    const runner = new Runner({
-      traceMetadata: {
-        __trace_source__: "agent-builder",
-        workflow_id: "wf_694a718c9964819089160a7912c26ee40d01ca396fad04f0"
-      }
-    });
-    const guardrailsInputText = workflow.input_as_text;
-    const { hasTripwire: guardrailsHasTripwire, safeText: guardrailsAnonymizedText, failOutput: guardrailsFailOutput, passOutput: guardrailsPassOutput } = await runAndApplyGuardrails(guardrailsInputText, jailbreakGuardrailConfig, conversationHistory, workflow);
-    const guardrailsOutput = (guardrailsHasTripwire ? guardrailsFailOutput : guardrailsPassOutput);
-    if (guardrailsHasTripwire) {
-      return guardrailsOutput;
-    } else {
-      const classificationAgentResultTemp = await runner.run(
-        classificationAgent,
-        [
-          ...conversationHistory
-        ]
-      );
-      conversationHistory.push(...classificationAgentResultTemp.newItems.map((item) => item.rawItem));
+class WorkflowInput(BaseModel):
+  input_as_text: str
 
-      if (!classificationAgentResultTemp.finalOutput) {
-          throw new Error("Agent result is undefined");
-      }
 
-      const classificationAgentResult = {
-        output_text: JSON.stringify(classificationAgentResultTemp.finalOutput),
-        output_parsed: classificationAgentResultTemp.finalOutput
-      };
-      if (classificationAgentResult.output_parsed.classification == "return_item") {
-        const returnAgentResultTemp = await runner.run(
-          returnAgent,
-          [
-            ...conversationHistory
-          ]
-        );
-        conversationHistory.push(...returnAgentResultTemp.newItems.map((item) => item.rawItem));
+# Main code entrypoint
+async def run_workflow(workflow_input: WorkflowInput):
+  with trace("Milieu Agent"):
+    state = {
 
-        if (!returnAgentResultTemp.finalOutput) {
-            throw new Error("Agent result is undefined");
-        }
-
-        const returnAgentResult = {
-          output_text: returnAgentResultTemp.finalOutput ?? ""
-        };
-        const approvalMessage = "Does this work for you?";
-
-        if (approvalRequest(approvalMessage)) {
-            const endResult = {
-              message: "Your return is on the way."
-            };
-            return endResult;
-        } else {
-            const endResult = {
-              message: "What else can I help you with?"
-            };
-            return endResult;
-        }
-      } else if (classificationAgentResult.output_parsed.classification == "get_information") {
-        const informationAgentResultTemp = await runner.run(
-          informationAgent,
-          [
-            ...conversationHistory
-          ]
-        );
-        conversationHistory.push(...informationAgentResultTemp.newItems.map((item) => item.rawItem));
-
-        if (!informationAgentResultTemp.finalOutput) {
-            throw new Error("Agent result is undefined");
-        }
-
-        const informationAgentResult = {
-          output_text: informationAgentResultTemp.finalOutput ?? ""
-        };
-      } else {
-        return classificationAgentResult;
-      }
     }
-  });
-}
+    workflow = workflow_input.model_dump()
+    conversation_history: list[TResponseInputItem] = [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": workflow["input_as_text"]
+          }
+        ]
+      }
+    ]
+    guardrails_input_text = workflow["input_as_text"]
+    guardrails_result = await run_and_apply_guardrails(guardrails_input_text, jailbreak_guardrail_config, conversation_history, workflow)
+    guardrails_hastripwire = guardrails_result["has_tripwire"]
+    guardrails_anonymizedtext = guardrails_result["safe_text"]
+    guardrails_output = (guardrails_hastripwire and guardrails_result["fail_output"]) or guardrails_result["pass_output"]
+    if guardrails_hastripwire:
+      return guardrails_output
+    else:
+      classification_agent_result_temp = await Runner.run(
+        classification_agent,
+        input=[
+          *conversation_history
+        ],
+        run_config=RunConfig(trace_metadata={
+          "__trace_source__": "agent-builder",
+          "workflow_id": "wf_694a718c9964819089160a7912c26ee40d01ca396fad04f0"
+        })
+      )
+
+      conversation_history.extend([item.to_input_item() for item in classification_agent_result_temp.new_items])
+
+      classification_agent_result = {
+        "output_text": classification_agent_result_temp.final_output.json(),
+        "output_parsed": classification_agent_result_temp.final_output.model_dump()
+      }
+      if classification_agent_result["output_parsed"]["classification"] == "return_item":
+        return_agent_result_temp = await Runner.run(
+          return_agent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_694a718c9964819089160a7912c26ee40d01ca396fad04f0"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in return_agent_result_temp.new_items])
+
+        return_agent_result = {
+          "output_text": return_agent_result_temp.final_output_as(str)
+        }
+        approval_message = "Does this work for you?"
+
+        if approval_request(approval_message):
+            end_result = {
+              "message": "Your return is on the way."
+            }
+            return end_result
+        else:
+            end_result = {
+              "message": "What else can I help you with?"
+            }
+            return end_result
+      elif classification_agent_result["output_parsed"]["classification"] == "get_information":
+        information_agent_result_temp = await Runner.run(
+          information_agent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_694a718c9964819089160a7912c26ee40d01ca396fad04f0"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in information_agent_result_temp.new_items])
+
+        information_agent_result = {
+          "output_text": information_agent_result_temp.final_output_as(str)
+        }
+      else:
+        return classification_agent_result
