@@ -5,5 +5,5 @@ requests
 
 openai>=1.107.1,<2
 openai-agents>=0.6.0
-openai-guardrails>=0.3.0
+openai-guardrails>=0.2.1,<0.3
 pydantic>=2.5
