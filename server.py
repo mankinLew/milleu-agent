@@ -1,11 +1,11 @@
+# server.py
 import os
 import traceback
-import openai as openai_pkg
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from openai import OpenAI
+import requests
 
 load_dotenv()
 
@@ -19,34 +19,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WORKFLOW_ID = os.getenv("CHATKIT_WORKFLOW_ID")
+
+
 @app.get("/")
 async def root():
-    return {"status": "ok", "openai_version": openai_pkg.__version__}
+    return {
+        "status": "ok",
+        "has_api_key": bool(OPENAI_API_KEY),
+        "has_workflow_id": bool(WORKFLOW_ID),
+    }
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-WORKFLOW_ID = os.getenv("CHATKIT_WORKFLOW_ID")
 
 class SessionRequest(BaseModel):
     user_id: str | None = None
 
+
 @app.post("/api/chatkit/session")
 async def create_chatkit_session(body: SessionRequest):
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OPENAI_API_KEY is not set")
     if not WORKFLOW_ID:
         raise HTTPException(500, "CHATKIT_WORKFLOW_ID is not set")
-    if not client.api_key:
-        raise HTTPException(500, "OPENAI_API_KEY is not set")
+
+    user = body.user_id or "anonymous"
 
     try:
-        user = body.user_id or "anonymous"
-
-        # ✅ IMPORTANT: Use top-level `.chatkit`, not `.beta.chatkit`
-        session = client.chatkit.sessions.create(
-            user=user,
-            workflow={"id": WORKFLOW_ID},
+        resp = requests.post(
+            "https://api.openai.com/v1/chatkit/sessions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+                "OpenAI-Beta": "chatkit_beta=v1",
+            },
+            json={
+                "workflow": {"id": WORKFLOW_ID},
+                "user": user,
+            },
+            timeout=10,
         )
 
-        return {"client_secret": session.client_secret}
+        if not resp.ok:
+            # Bubble up OpenAI error body so you can see what's wrong
+            raise HTTPException(
+                status_code=500,
+                detail=f"OpenAI error {resp.status_code}: {resp.text}",
+            )
 
+        data = resp.json()
+        client_secret = data.get("client_secret")
+        if not client_secret:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Missing client_secret in OpenAI response: {data}",
+            )
+
+        return {"client_secret": client_secret}
+
+    except HTTPException:
+        # Already handled above
+        raise
     except Exception as e:
         print("ERROR in /api/chatkit/session:", e)
         traceback.print_exc()
