@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi import Response
 
 from agent_workflow import run_workflow, WorkflowInput  # uses your exported agent
 
@@ -16,9 +17,9 @@ load_dotenv()
 app = FastAPI()
 
 # Get health endpoint
-@app.get("/healthz")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz():
-    return {"ok": True}
+    return Response(status_code=200)
 
 # CORS so Freshdesk + n8n can call the backend
 app.add_middleware(
