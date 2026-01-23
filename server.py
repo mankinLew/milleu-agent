@@ -15,6 +15,11 @@ load_dotenv()
 
 app = FastAPI()
 
+# Get health endpoint
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
 # CORS so Freshdesk + n8n can call the backend
 app.add_middleware(
     CORSMiddleware,
