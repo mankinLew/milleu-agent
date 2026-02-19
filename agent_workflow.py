@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from agents import function_tool, Agent, ModelSettings, TResponseInputItem, Runner, RunConfig, trace
+from agents import (
+    function_tool,
+    Agent,
+    ModelSettings,
+    TResponseInputItem,
+    Runner,
+    RunConfig,
+    trace,
+)
 from openai import AsyncOpenAI
 from types import SimpleNamespace
 from guardrails.runtime import load_config_bundle, instantiate_guardrails, run_guardrails
@@ -33,11 +41,13 @@ ctx = SimpleNamespace(guardrail_llm=client)
 
 # =============================================================================
 # Guardrails definitions
-# NOTE: Added "Contains PII" because scrubbers expect it.
+# NOTE:
+# - openai-guardrails==0.2.1 'Contains PII' config does NOT accept 'model' or
+#   'confidence_threshold'. Keep it minimal to avoid pydantic extra_forbidden.
 # =============================================================================
 jailbreak_guardrail_config = {
     "guardrails": [
-        {"name": "Contains PII", "config": {"model": "gpt-4.1-mini", "block": False, "confidence_threshold": 0.7}},
+        {"name": "Contains PII", "config": {"block": False}},  # ✅ FIXED
         {"name": "Jailbreak", "config": {"model": "gpt-5-nano", "confidence_threshold": 0.7}},
         {"name": "NSFW Text", "config": {"model": "gpt-4.1-mini", "confidence_threshold": 0.7}},
         {
@@ -254,7 +264,6 @@ def build_guardrail_fail_output(results: list[Any]) -> dict[str, Any]:
             "hallucinated_statements": (hal_info.get("hallucinated_statements") if isinstance(hal_info, dict) else None),
             "verified_statements": (hal_info.get("verified_statements") if isinstance(hal_info, dict) else None),
         },
-        "nsfw": {"failed": _tripwire(nsfw)},
         "url_filter": {"failed": _tripwire(url)},
         "custom_prompt_check": {"failed": _tripwire(custom)},
         "prompt_injection": {"failed": _tripwire(pid)},
@@ -590,7 +599,6 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
         )
 
         guardrails_hastripwire = guardrails_result["has_tripwire"]
-        guardrails_anonymizedtext = guardrails_result["safe_text"]  # available if you want to use it
         guardrails_output = (guardrails_hastripwire and guardrails_result["fail_output"]) or guardrails_result["pass_output"]
 
         if guardrails_hastripwire:
@@ -621,6 +629,7 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
                 trace_metadata={
                     "__trace_source__": "agent-builder",
                     "workflow_id": "wf_694a718c9964819089160a7912c26ee40d01ca396fad04f0",
+                    # Optional: you can include session identifiers here if desired
                 }
             ),
         )
