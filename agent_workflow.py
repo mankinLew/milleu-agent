@@ -14,6 +14,38 @@ from types import SimpleNamespace
 from guardrails.runtime import load_config_bundle, instantiate_guardrails, run_guardrails
 from pydantic import BaseModel
 from typing import Any
+import re
+
+
+# =============================================================================
+# Hard block: numeric computation / calculator prompts
+# =============================================================================
+_ARITH_RE = re.compile(
+    r"""
+    (?ix)
+    (?=.*\d)                 # at least one digit
+    (?=.*[+\-*/%^])          # at least one arithmetic operator
+    [0-9+\-*/%^().\s=]{3,}   # mostly expression chars
+"""
+)
+
+
+def is_numeric_computation(text: str) -> bool:
+    t = (text or "").strip()
+
+    # common phrasing with numbers
+    if re.search(r"(?i)\b(what\s+is|calculate|compute|solve|evaluate)\b", t) and re.search(r"\d", t):
+        return True
+
+    # pure expression-ish input
+    if _ARITH_RE.fullmatch(t):
+        return True
+
+    # short message containing a clear expression, e.g. "pls 1+2"
+    if _ARITH_RE.search(t) and len(t) <= 60:
+        return True
+
+    return False
 
 
 # =============================================================================
@@ -47,7 +79,7 @@ ctx = SimpleNamespace(guardrail_llm=client)
 # =============================================================================
 jailbreak_guardrail_config = {
     "guardrails": [
-        {"name": "Contains PII", "config": {"block": False}},  # ✅ FIXED
+        {"name": "Contains PII", "config": {"block": False}},  # ✅ minimal valid config for 0.2.1
         {"name": "Jailbreak", "config": {"model": "gpt-5-nano", "confidence_threshold": 0.7}},
         {"name": "NSFW Text", "config": {"model": "gpt-4.1-mini", "confidence_threshold": 0.7}},
         {
@@ -255,7 +287,10 @@ def build_guardrail_fail_output(results: list[Any]) -> dict[str, Any]:
 
     return {
         "pii": {"failed": (len(pii_counts) > 0) or _tripwire(pii), "detected_counts": pii_counts},
-        "moderation": {"failed": _tripwire(mod) or (len(flagged_categories) > 0), "flagged_categories": flagged_categories},
+        "moderation": {
+            "failed": _tripwire(mod) or (len(flagged_categories) > 0),
+            "flagged_categories": flagged_categories,
+        },
         "jailbreak": {"failed": _tripwire(jb)},
         "hallucination": {
             "failed": _tripwire(hal),
@@ -264,6 +299,7 @@ def build_guardrail_fail_output(results: list[Any]) -> dict[str, Any]:
             "hallucinated_statements": (hal_info.get("hallucinated_statements") if isinstance(hal_info, dict) else None),
             "verified_statements": (hal_info.get("verified_statements") if isinstance(hal_info, dict) else None),
         },
+        "nsfw": {"failed": _tripwire(nsfw)},
         "url_filter": {"failed": _tripwire(url)},
         "custom_prompt_check": {"failed": _tripwire(custom)},
         "prompt_injection": {"failed": _tripwire(pid)},
@@ -327,6 +363,8 @@ retention_agent = Agent(
 information_agent = Agent(
     name="Information agent",
     instructions="""You are an information agent for answering informational queries. Your aim is to provide clear, concise responses to user questions. Use the policy below to assemble your answer.
+
+IMPORTANT: Do NOT perform or answer numeric computations (e.g. 1+2, 15% of 80). If the user requests calculations, refuse and redirect them to Milieu support topics.
 
 Company Name: Milieu Insights Region: South East Asia
 Milieu Support Chatbot – Master Instruction Set
@@ -578,15 +616,23 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
 
         workflow = workflow_input.model_dump()
 
+        # ✅ HARD BLOCK numeric computations BEFORE any model runs
+        user_text = workflow.get("input_as_text", "")
+        if is_numeric_computation(user_text):
+            return {
+                "final": {
+                    "message": (
+                        "I can’t help with calculations. I’m only able to assist with Milieu app/support questions. "
+                        "Please ask about surveys, rewards, account issues, donations, or technical troubleshooting."
+                    )
+                },
+                "state": state,
+            }
+
         conversation_history: list[TResponseInputItem] = [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": workflow["input_as_text"],
-                    }
-                ],
+                "content": [{"type": "input_text", "text": workflow["input_as_text"]}],
             }
         ]
 
@@ -629,7 +675,6 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
                 trace_metadata={
                     "__trace_source__": "agent-builder",
                     "workflow_id": "wf_694a718c9964819089160a7912c26ee40d01ca396fad04f0",
-                    # Optional: you can include session identifiers here if desired
                 }
             ),
         )
