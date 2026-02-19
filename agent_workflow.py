@@ -22,11 +22,11 @@ import re
 # =============================================================================
 _ARITH_RE = re.compile(
     r"""
-    (?ix)
-    (?=.*\d)                 # at least one digit
-    (?=.*[+\-*/%^])          # at least one arithmetic operator
-    [0-9+\-*/%^().\s=]{3,}   # mostly expression chars
-"""
+    (?=.*\d)
+    (?=.*[+\-*/%^])
+    [0-9+\-*/%^().\s=]{3,}
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
 )
 
 
