@@ -34,7 +34,7 @@ def is_numeric_computation(text: str) -> bool:
     t = (text or "").strip()
 
     # common phrasing with numbers
-    if re.search(r"(?i)\b(what\s+is|calculate|compute|solve|evaluate)\b", t) and re.search(r"\d", t):
+    if re.search(r"\b(what\s+is|calculate|compute|solve|evaluate)\b", t, flags=re.IGNORECASE) and re.search(r"\d", t):
         return True
 
     # pure expression-ish input
@@ -75,6 +75,8 @@ def detect_lang_simple(text: str) -> str:
         " lepas ",
         " dalam ",
         " macam ",
+        " terima kasih ",
+        " sila ",
     ]
     score = sum(1 for w in markers if w in t)
     return "ms" if score >= 2 else "en"
@@ -133,6 +135,10 @@ def render_paths(text: str, lang: str) -> str:
         return ui_path(lang, parts)
 
     return _PATH_TOKEN_RE.sub(repl, text)
+
+
+def localize_fixed(lang: str, en: str, ms: str) -> str:
+    return ms if lang == "ms" else en
 
 
 # =============================================================================
@@ -739,27 +745,42 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
 
         # ✅ HARD BLOCK numeric computations BEFORE any model runs
         if is_numeric_computation(user_text):
-            message = (
-                "Saya tak boleh bantu buat kiraan. Saya hanya boleh bantu soalan berkaitan aplikasi/sokongan Milieu. "
-                "Sila tanya tentang tinjauan (survey), ganjaran, akaun, derma, atau penyelesaian masalah teknikal."
-                if lang == "ms"
-                else "I can’t help with calculations. I’m only able to assist with Milieu app/support questions. "
-                "Please ask about surveys, rewards, account issues, donations, or technical troubleshooting."
+            message = localize_fixed(
+                lang,
+                en=(
+                    "I can’t help with calculations. I’m only able to assist with Milieu app/support questions. "
+                    "Please ask about surveys, rewards, account issues, donations, or technical troubleshooting."
+                ),
+                ms=(
+                    "Saya tak boleh bantu buat kiraan. Saya hanya boleh bantu soalan berkaitan aplikasi/sokongan Milieu. "
+                    "Sila tanya tentang tinjauan (survey), ganjaran, akaun, derma, atau penyelesaian masalah teknikal."
+                ),
             )
             return {"final": {"message": message}, "state": state}
 
+        # ✅ Add system directive so ALL downstream agents follow the user's language + token rule
+        system_directive = (
+            "You must reply in Malay (Bahasa Melayu) only. " if lang == "ms"
+            else "You must reply in English only. "
+        )
+        system_directive += "Do not do any numeric calculations. Follow the UI PATH OUTPUT RULE using __PATH__ tokens."
+
         conversation_history: list[TResponseInputItem] = [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_directive}],
+            },
             {
                 "role": "user",
                 "content": [{"type": "input_text", "text": workflow["input_as_text"]}],
-            }
+            },
         ]
 
         guardrails_input_text = workflow["input_as_text"]
         guardrails_result = await run_and_apply_guardrails(
             guardrails_input_text,
             jailbreak_guardrail_config,
-            conversation_history,
+            conversation_history,  # include system message for scrubber too
             workflow,
         )
 
@@ -828,11 +849,11 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
             localized = render_paths(raw, lang)
             return_agent_result = {"output_text": localized}
 
-            approval_message = "Does this work for you?" if lang != "ms" else "Boleh macam ini?"
+            approval_message = localize_fixed(lang, en="Does this work for you?", ms="Boleh macam ini?")
             if approval_request(approval_message):
-                end_result = {"message": "Your return is on the way." if lang != "ms" else "Pemulangan anda sedang dihantar."}
+                end_result = {"message": localize_fixed(lang, en="Your return is on the way.", ms="Pemulangan anda sedang dihantar.")}
             else:
-                end_result = {"message": "What else can I help you with?" if lang != "ms" else "Apa lagi saya boleh bantu?"}
+                end_result = {"message": localize_fixed(lang, en="What else can I help you with?", ms="Apa lagi saya boleh bantu?")}
 
             return {
                 "guardrails": guardrails_output,
