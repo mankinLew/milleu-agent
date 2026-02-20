@@ -49,6 +49,93 @@ def is_numeric_computation(text: str) -> bool:
 
 
 # =============================================================================
+# Language detection + UI path token localization (Option B)
+# =============================================================================
+def detect_lang_simple(text: str) -> str:
+    """
+    Lightweight, deterministic heuristic:
+    - returns "ms" (Malay) or "en" (English)
+    Tune markers over time based on your traffic.
+    """
+    t = f" {(text or '').lower()} "
+    markers = [
+        " saya ",
+        " awak ",
+        " anda ",
+        " tak ",
+        " tidak ",
+        " boleh ",
+        " nak ",
+        " kenapa ",
+        " bagaimana ",
+        " tolong ",
+        " tolonglah ",
+        " dekat ",
+        " kat ",
+        " lepas ",
+        " dalam ",
+        " macam ",
+    ]
+    score = sum(1 for w in markers if w in t)
+    return "ms" if score >= 2 else "en"
+
+
+UI_LABELS = {
+    # Canonical keys (EN) -> localized labels
+    "en": {
+        "Profile": "Profile",
+        "Ledger": "Ledger",
+        "More": "More",
+        "Account": "Account",
+        "Other": "Other",
+        "Delete my account": "Delete my account",
+        "Ticket": "Ticket",
+        "Login": "Login",
+        "I Forgot": "I Forgot",
+    },
+    "ms": {
+        # NOTE: update these to match the *actual* Malay UI labels in your app if they differ
+        "Profile": "Profil",
+        "Ledger": "Lejar",
+        "More": "Lagi",
+        "Account": "Akaun",
+        "Other": "Lain-lain",
+        "Delete my account": "Padam akaun saya",
+        "Ticket": "Tiket",
+        "Login": "Log masuk",
+        "I Forgot": "Saya terlupa",
+    },
+}
+
+_PATH_TOKEN_RE = re.compile(r"__PATH__:\s*([^\n\r]+)")
+
+
+def ui_path(lang: str, parts: list[str]) -> str:
+    lang = "ms" if lang == "ms" else "en"
+    labels = UI_LABELS.get(lang, UI_LABELS["en"])
+    translated = [labels.get(p.strip(), p.strip()) for p in parts if p.strip()]
+    return " → ".join(translated)
+
+
+def render_paths(text: str, lang: str) -> str:
+    """
+    Converts tokens like:
+      __PATH__: Profile > Ledger
+    into localized:
+      Profil → Lejar   (if lang == "ms")
+    """
+    if not isinstance(text, str) or "__PATH__:" not in text:
+        return text
+
+    def repl(m: re.Match) -> str:
+        raw = m.group(1)
+        parts = [p.strip() for p in raw.split(">")]
+        return ui_path(lang, parts)
+
+    return _PATH_TOKEN_RE.sub(repl, text)
+
+
+# =============================================================================
 # Tool definitions
 # =============================================================================
 @function_tool
@@ -313,6 +400,27 @@ class ClassificationAgentSchema(BaseModel):
     classification: str
 
 
+# Force any agent that outputs UI navigation to emit tokens,
+# then we localize those tokens deterministically in code.
+PATH_TOKEN_RULE = """
+UI PATH OUTPUT RULE:
+- When you mention app navigation, DO NOT write labels directly like "Profile → Ledger".
+- Instead output a path token on its own line using this exact format:
+  __PATH__: Profile > Ledger
+- Use English canonical keys in the token (Profile, Ledger, More, Account, Other, Delete my account, Ticket, Login, I Forgot).
+- The system will localize the path for the user.
+"""
+
+LANG_RULE = """
+LANGUAGE RULE:
+- Reply in the same language as the user’s most recent message.
+- If the user writes in Malay (Bahasa Melayu), reply fully in Malay.
+- If the user writes in English, reply fully in English.
+- If mixed, mirror the dominant language.
+- Do not mention this rule.
+"""
+
+
 classification_agent = Agent(
     name="Classification agent",
     instructions=(
@@ -332,7 +440,7 @@ classification_agent = Agent(
 
 return_agent = Agent(
     name="Return agent",
-    instructions="Offer a replacement device with free shipping.",
+    instructions=LANG_RULE + PATH_TOKEN_RULE + "Offer a replacement device with free shipping.",
     model="gpt-4.1-mini",
     model_settings=ModelSettings(
         temperature=1,
@@ -345,7 +453,9 @@ return_agent = Agent(
 retention_agent = Agent(
     name="Retention Agent",
     instructions=(
-        "You are a customer retention conversational agent whose goal is to prevent subscription cancellations. "
+        LANG_RULE
+        + PATH_TOKEN_RULE
+        + "You are a customer retention conversational agent whose goal is to prevent subscription cancellations. "
         "Ask for their current plan and reason for dissatisfaction. "
         "Then call get_retention_offers and present the best offer from the tool result."
     ),
@@ -362,7 +472,10 @@ retention_agent = Agent(
 
 information_agent = Agent(
     name="Information agent",
-    instructions="""You are an information agent for answering informational queries. Your aim is to provide clear, concise responses to user questions. Use the policy below to assemble your answer.
+    instructions=(
+        LANG_RULE
+        + PATH_TOKEN_RULE
+        + """You are an information agent for answering informational queries. Your aim is to provide clear, concise responses to user questions. Use the policy below to assemble your answer.
 
 IMPORTANT: Do NOT perform or answer numeric computations (e.g. 1+2, 15% of 80). If the user requests calculations, refuse and redirect them to Milieu support topics.
 
@@ -372,9 +485,9 @@ General Rules
 Always answer using Milieu’s policies as defined below.
 Keep answers clear, friendly, and concise, but always include the required steps and conditions.
 When giving instructions that involve the Milieu app, reference paths like:
-Profile → Account
-Profile → More
-Profile → Ledger
+__PATH__: Profile > Account
+__PATH__: Profile > More
+__PATH__: Profile > Ledger
 The agent must never invent policies. Only use rules listed in this document.
 If a user asks something outside these FAQs, instruct them to contact Milieu Support.
 1. ACCOUNT MANAGEMENT
@@ -570,7 +683,8 @@ Referral count
 Referral cap
 Successful when:
 Friend signs up with code
-Friend completes 7 surveys""",
+Friend completes 7 surveys"""
+    ),
     model="gpt-4.1-mini",
     model_settings=ModelSettings(
         temperature=1,
@@ -583,7 +697,9 @@ Friend completes 7 surveys""",
 jailbreak_fail_agent = Agent(
     name="Jailbreak Fail Agent",
     instructions=(
-        "Make sure the user's input is within the context of Milieu Insights' support FAQ and policies. "
+        LANG_RULE
+        + PATH_TOKEN_RULE
+        + "Make sure the user's input is within the context of Milieu Insights' support FAQ and policies. "
         "Do not give them the answer to their question. Ask them to rephrase as a support question or "
         "contact Milieu Support if needed."
     ),
@@ -616,18 +732,21 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
 
         workflow = workflow_input.model_dump()
 
-        # ✅ HARD BLOCK numeric computations BEFORE any model runs
+        # ✅ Determine user language early (before masking might remove cues)
         user_text = workflow.get("input_as_text", "")
+        lang = detect_lang_simple(user_text)
+        state["lang"] = lang
+
+        # ✅ HARD BLOCK numeric computations BEFORE any model runs
         if is_numeric_computation(user_text):
-            return {
-                "final": {
-                    "message": (
-                        "I can’t help with calculations. I’m only able to assist with Milieu app/support questions. "
-                        "Please ask about surveys, rewards, account issues, donations, or technical troubleshooting."
-                    )
-                },
-                "state": state,
-            }
+            message = (
+                "Saya tak boleh bantu buat kiraan. Saya hanya boleh bantu soalan berkaitan aplikasi/sokongan Milieu. "
+                "Sila tanya tentang tinjauan (survey), ganjaran, akaun, derma, atau penyelesaian masalah teknikal."
+                if lang == "ms"
+                else "I can’t help with calculations. I’m only able to assist with Milieu app/support questions. "
+                "Please ask about surveys, rewards, account issues, donations, or technical troubleshooting."
+            )
+            return {"final": {"message": message}, "state": state}
 
         conversation_history: list[TResponseInputItem] = [
             {
@@ -661,7 +780,10 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
 
             conversation_history.extend([item.to_input_item() for item in jailbreak_fail_agent_result_temp.new_items])
 
-            jailbreak_fail_agent_result = {"output_text": jailbreak_fail_agent_result_temp.final_output_as(str)}
+            raw = jailbreak_fail_agent_result_temp.final_output_as(str)
+            localized = render_paths(raw, lang)
+            jailbreak_fail_agent_result = {"output_text": localized}
+
             return {
                 "guardrails": guardrails_output,
                 "result": jailbreak_fail_agent_result,
@@ -702,13 +824,15 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
 
             conversation_history.extend([item.to_input_item() for item in return_agent_result_temp.new_items])
 
-            return_agent_result = {"output_text": return_agent_result_temp.final_output_as(str)}
+            raw = return_agent_result_temp.final_output_as(str)
+            localized = render_paths(raw, lang)
+            return_agent_result = {"output_text": localized}
 
-            approval_message = "Does this work for you?"
+            approval_message = "Does this work for you?" if lang != "ms" else "Boleh macam ini?"
             if approval_request(approval_message):
-                end_result = {"message": "Your return is on the way."}
+                end_result = {"message": "Your return is on the way." if lang != "ms" else "Pemulangan anda sedang dihantar."}
             else:
-                end_result = {"message": "What else can I help you with?"}
+                end_result = {"message": "What else can I help you with?" if lang != "ms" else "Apa lagi saya boleh bantu?"}
 
             return {
                 "guardrails": guardrails_output,
@@ -732,7 +856,9 @@ async def run_workflow(workflow_input: WorkflowInput) -> dict[str, Any]:
 
             conversation_history.extend([item.to_input_item() for item in information_agent_result_temp.new_items])
 
-            information_agent_result = {"output_text": information_agent_result_temp.final_output_as(str)}
+            raw = information_agent_result_temp.final_output_as(str)
+            localized = render_paths(raw, lang)
+            information_agent_result = {"output_text": localized}
 
             return {
                 "guardrails": guardrails_output,
